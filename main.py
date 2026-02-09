@@ -5,6 +5,7 @@ import os
 import shutil
 import time
 import traceback
+import gc
 
 from src.services.db_service.census_db_service import (
     fetch_pending_census_uploads,
@@ -77,7 +78,15 @@ def get_mapper_for_portal(portal_name):
 
 async def run_census_loop():
     logger.info("Starting Census Processing Loop...")
+    logger.info("Available mappers: %s", list(CENSUS_MAPPING.keys()) + EMAIL_PORTALS)
+    
     while True:
+        # Processing tracking variables
+        requested_portals = []
+        completed_portals = []
+        failed_portals = []
+        processing_errors = []
+        
         try:
             # 1. Clear directories
             await clear_files()
@@ -89,7 +98,9 @@ async def run_census_loop():
                 continue
                 
             upload_id = req['id']
+            logger.info(f"="*60)
             logger.info(f"Processing Request ID: {upload_id}")
+            logger.info(f"="*60)
             
             # 3. Update status to Processing
             update_upload_status(upload_id, "Processing")
@@ -107,67 +118,190 @@ async def run_census_loop():
             email_copy_path = os.path.join(ATTACHMENTS_SAVE_DIR, "CensusData-TEMPLATE_Common with Nationality.xlsx")
             shutil.copy(input_path, email_copy_path)
             
-            # 5. Parse Portals
+            # 5. Parse Portals and Other Data
             portals_json = req['portals']
+            other_data_json = req.get('other_data', '{}')
+            
             try:
                 if isinstance(portals_json, str):
                     portals = json.loads(portals_json)
                 else:
                     portals = portals_json 
+                    
+                requested_portals = portals.copy() if portals else []
+                logger.info(f"Requested Portals ({len(requested_portals)}): {requested_portals}")
+                
+                # Parse other_data JSON
+                try:
+                    if isinstance(other_data_json, str):
+                        other_data = json.loads(other_data_json) if other_data_json else {}
+                    else:
+                        other_data = other_data_json if other_data_json else {}
+                    logger.info(f"Other Data: {other_data}")
+                except Exception as parse_error:
+                    logger.warning(f"Failed to parse other_data JSON: {parse_error}, using empty dict")
+                    other_data = {}
+                
             except Exception as e:
-                logger.error(f"Failed to parse portals JSON: {e}")
+                error_msg = f"Failed to parse portals JSON: {e}"
+                logger.error(error_msg)
+                processing_errors.append(error_msg)
                 update_upload_status(upload_id, "Failed")
                 continue
-                
-            logger.info(f"Requested Portals: {portals}")
             
-            # 6. Execute Mappers
-            has_error = False
-            processed_mappers = set() # Track executed mappers to avoid re-running for same group (e.g. Email)
+            # 6. Execute Mappers with detailed tracking
+            processed_mappers = set()  # Track executed mappers to avoid re-running for same group (e.g. Email)
             
             for portal in portals:
-                mapper_info = get_mapper_for_portal(portal)
-                if not mapper_info:
-                    logger.warning(f"No mapper found for portal: {portal}")
-                    continue
+                portal_start_time = time.time()
+                logger.info(f"Processing portal: {portal}")
                 
-                func, output_dir, filename = mapper_info
-                
-                # Run mapper only if not already run (important for grouped email portals)
-                if func not in processed_mappers:
-                    logger.info(f"Running mapper for {portal}...")
-                    try:
-                        func('default')
-                        processed_mappers.add(func)
-                    except Exception as e:
-                        logger.error(f"Error running mapper for {portal}: {e}")
-                        logger.error(traceback.format_exc())
-                        has_error = True
+                try:
+                    mapper_info = get_mapper_for_portal(portal)
+                    if not mapper_info:
+                        error_msg = f"No mapper found for portal: {portal}"
+                        logger.warning(error_msg)
+                        failed_portals.append({"portal": portal, "reason": "No mapper available"})
+                        processing_errors.append(error_msg)
                         continue
-                
-                # 7. Check output and Insert
-                output_path = os.path.join(output_dir, filename)
-                if os.path.exists(output_path):
-                    if insert_generated_census(upload_id, portal, output_path):
-                        logger.info(f"Generated census for {portal} saved to DB.")
+                    
+                    func, output_dir, filename = mapper_info
+                    
+                    # Run mapper only if not already run (important for grouped email portals)
+                    if func not in processed_mappers:
+                        logger.info(f"Running mapper function for {portal}...")
+                        try:
+                            # Pass other_data to mappers that support it (like GIG)
+                            if portal == 'GIG':
+                                func('default', other_data)
+                            else:
+                                func('default')
+                            processed_mappers.add(func)
+                            logger.info(f"Mapper function completed for {portal}")
+                        except Exception as e:
+                            error_msg = f"Error running mapper for {portal}: {str(e)}"
+                            logger.error(error_msg)
+                            logger.error(f"Full traceback for {portal}: {traceback.format_exc()}")
+                            failed_portals.append({"portal": portal, "reason": f"Mapper execution error: {str(e)}"})
+                            processing_errors.append(error_msg)
+                            continue
                     else:
-                        logger.error(f"Failed to insert census for {portal} to DB.")
-                        has_error = True
-                else:
-                    logger.error(f"Expected output file not found for {portal}: {output_path}")
-                    has_error = True
+                        logger.info(f"Mapper function already executed for {portal} (shared mapper)")
+                    
+                    # 7. Check output and Insert
+                    output_path = os.path.join(output_dir, filename)
+                    if os.path.exists(output_path):
+                        file_size = os.path.getsize(output_path)
+                        logger.info(f"Output file found for {portal}: {filename} ({file_size:,} bytes)")
+                        
+                        # Add a brief delay for Excel COM files to ensure they're fully closed
+                        if portal in ['DAMAN', 'IQ'] and func.__name__ in ['daman_map_data', 'iq_map_data']:
+                            logger.info(f"Waiting for Excel file to be fully released for {portal}...")
+                            time.sleep(2.0)
+                            import gc
+                            gc.collect()  # Force garbage collection to help release Excel handles
+                        
+                        if insert_generated_census(upload_id, portal, output_path):
+                            portal_duration = time.time() - portal_start_time
+                            logger.info(f"✅ SUCCESS - {portal} completed in {portal_duration:.2f}s")
+                            completed_portals.append(portal)
+                        else:
+                            error_msg = f"Failed to insert census for {portal} to database"
+                            logger.error(error_msg)
+                            failed_portals.append({"portal": portal, "reason": "Database insertion failed"})
+                            processing_errors.append(error_msg)
+                    else:
+                        error_msg = f"Expected output file not found for {portal}: {output_path}"
+                        logger.error(error_msg)
+                        # List what files are actually in the directory
+                        if os.path.exists(output_dir):
+                            actual_files = os.listdir(output_dir)
+                            logger.error(f"Files found in {output_dir}: {actual_files}")
+                        else:
+                            logger.error(f"Output directory does not exist: {output_dir}")
+                        
+                        failed_portals.append({"portal": portal, "reason": "Output file not generated"})
+                        processing_errors.append(error_msg)
+                        
+                except Exception as e:
+                    error_msg = f"Unexpected error processing {portal}: {str(e)}"
+                    logger.error(error_msg)
+                    logger.error(f"Full traceback for {portal}: {traceback.format_exc()}")
+                    failed_portals.append({"portal": portal, "reason": f"Unexpected error: {str(e)}"})
+                    processing_errors.append(error_msg)
             
-            # 8. Update Final Status
-            final_status = "Failed" if has_error else "Completed"
+            # 8. Generate Processing Summary
+            logger.info(f"\n" + "="*60)
+            logger.info(f"PROCESSING SUMMARY - Request ID: {upload_id}")
+            logger.info(f"="*60)
+            
+            # Portal statistics
+            total_requested = len(requested_portals)
+            total_completed = len(completed_portals)
+            total_failed = len(failed_portals)
+            success_rate = (total_completed / total_requested * 100) if total_requested > 0 else 0
+            
+            logger.info(f"Total Requested Portals: {total_requested}")
+            logger.info(f"Successfully Completed: {total_completed}")
+            logger.info(f"Failed: {total_failed}")
+            logger.info(f"Success Rate: {success_rate:.1f}%")
+            
+            # Detailed results
+            if completed_portals:
+                logger.info(f"\n✅ COMPLETED PORTALS ({len(completed_portals)}):")
+                for portal in completed_portals:
+                    logger.info(f"   - {portal}")
+            
+            if failed_portals:
+                logger.error(f"\n❌ FAILED PORTALS ({len(failed_portals)}):")
+                for failed in failed_portals:
+                    logger.error(f"   - {failed['portal']}: {failed['reason']}")
+            
+            # Check for any requested portals that weren't processed
+            not_processed = [p for p in requested_portals if p not in completed_portals and p not in [f['portal'] for f in failed_portals]]
+            if not_processed:
+                logger.warning(f"\n⚠️  PORTALS NOT PROCESSED ({len(not_processed)}):")
+                for portal in not_processed:
+                    logger.warning(f"   - {portal}: Not attempted")
+            
+            # Log all errors encountered
+            if processing_errors:
+                logger.error(f"\n🚨 PROCESSING ERRORS ({len(processing_errors)}):")
+                for idx, error in enumerate(processing_errors, 1):
+                    logger.error(f"   {idx}. {error}")
+            
+            # Final status determination
+            if total_completed == total_requested and not processing_errors:
+                final_status = "Completed"
+                logger.info(f"\n🎉 ALL PORTALS COMPLETED SUCCESSFULLY!")
+            elif total_completed > 0:
+                final_status = "Partial"
+                logger.warning(f"\n⚠️  PARTIAL SUCCESS: {total_completed}/{total_requested} portals completed")
+            else:
+                final_status = "Failed"
+                logger.error(f"\n💥 ALL PORTALS FAILED")
+            
+            # 9. Update Final Status
             update_upload_status(upload_id, final_status)
-            logger.info(f"Request {upload_id} finished with status: {final_status}")
+            logger.info(f"\nRequest {upload_id} finished with status: {final_status}")
+            logger.info(f"="*60 + "\n")
             
             # Sleep briefly before next poll
             time.sleep(5)
             
         except Exception as e:
-            logger.error(f"Critical error in main loop: {e}")
-            logger.error(traceback.format_exc())
+            error_msg = f"Critical error in main loop: {e}"
+            logger.error(error_msg)
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            
+            # Try to update status if we have upload_id
+            try:
+                if 'upload_id' in locals():
+                    update_upload_status(upload_id, "Failed")
+                    logger.error(f"Request {upload_id} marked as failed due to critical error")
+            except Exception as status_error:
+                logger.error(f"Failed to update status after critical error: {status_error}")
+            
             time.sleep(10)
 
 if __name__ == "__main__":

@@ -41,7 +41,7 @@ def parse_date_format(date_str):
     return None
 
 
-def gig_map_census_data(id):
+def gig_map_census_data(id, other_data=None):
     census_filename = ""
     if id == 'default':
         for file_name in os.listdir(ATTACHMENTS_SAVE_DIR):
@@ -88,14 +88,46 @@ def gig_map_census_data(id):
 
 
 
-    ##Effective Date
-    df1, df2 = read_excel('GIG Insurance', 'default')
-
-    # Check if the dataframes are empty
-    if df1.empty:
-        print("No data found sheet1")
-        logger.error("No data found sheet1")
-        raise Exception("No data found sheet1")
+    ##Effective Date - Read from database other_data instead of Excel file
+    effective_date = None
+    
+    # Try to get effective date from other_data first
+    if other_data and isinstance(other_data, dict):
+        effective_date = other_data.get('Effective from')
+        if effective_date:
+            logger.info(f"Using effective date from database: {effective_date}")
+    
+    # Fallback to reading from Excel file if not found in other_data
+    if not effective_date:
+        logger.info("Effective date not found in database, trying to read from Excel file...")
+        df1, df2 = read_excel('GIG Insurance', 'default')
+        
+        # Check if the dataframes are empty
+        if df1.empty:
+            print("No data found sheet1")
+            logger.error("No data found sheet1")
+            raise Exception("No data found sheet1")
+        
+        # Extract the effective date from the DataFrame
+        try:
+            # Check if the required columns exist
+            if 'KEY' in df1.columns and 'VALUE' in df1.columns:
+                effective_from_rows = df1[df1['KEY'] == "Effective from"]
+                if not effective_from_rows.empty and len(effective_from_rows['VALUE'].values) > 0:
+                    effective_date = effective_from_rows['VALUE'].values[0].strip()
+                    logger.info("Effective date read from Excel file: " + effective_date)
+                else:
+                    logger.warning("'Effective from' row not found in KEY column, using default date")
+                    effective_date = "01/01/2024"  # Default date
+            else:
+                logger.warning("KEY or VALUE columns not found in df1, using default effective date")
+                effective_date = "01/01/2024"  # Default date
+        except Exception as e:
+            logger.error(f"Error extracting effective date from Excel: {e}")
+            effective_date = "01/01/2024"  # Default date
+    
+    # Ensure we have a valid effective date
+    effective_date = effective_date or "01/01/2024"
 
 
     #Data mapping for census
@@ -204,9 +236,8 @@ def gig_map_census_data(id):
         ws.cell(row=index+2, column=9).value = cat
 
 
-    # Extract the effective date from the DataFrame
-    effective_date = df1[df1['KEY'] == "Effective from"]['VALUE'].values[0].strip()
-    logger.debug("Effective date given: " + effective_date)
+    # Use the effective_date we determined above (from database or Excel fallback)
+    logger.debug("Final effective date to use: " + str(effective_date))
 
     # Convert string to datetime object
     try:
