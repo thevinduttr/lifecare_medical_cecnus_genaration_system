@@ -1,0 +1,14 @@
+venv
+__pycache__
+config.yaml
+external_programs
+database
+referral_file_store
+app.log
+logs
+prev_versions_files
+BOT-Processing
+testing
+captcha.png
+o365_token.txt
+src/services/db_config/config.py
