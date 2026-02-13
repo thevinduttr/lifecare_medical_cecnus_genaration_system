@@ -6,11 +6,15 @@ import shutil
 import time
 import traceback
 import gc
+import glob
+import re
 
 from src.services.db_service.census_db_service import (
     fetch_pending_census_uploads,
     update_upload_status,
     insert_generated_census,
+    insert_failed_census,
+    update_census_portal_status,
     save_base64_to_file
 )
 from src.utils.load_yaml import (
@@ -179,6 +183,52 @@ COMPANY_NAME_MAPPING = {
     "Union Insurance": "UNION_INSURANCE",  # Email portal
     "UNION_INSURANCE": "UNION_INSURANCE",
 }
+
+def find_generated_file(output_dir, expected_filename, portal_name, logger):
+    """
+    Find the generated census file, handling both exact matches and timestamped versions.
+    
+    For cases where file locking prevented saving with the exact filename,
+    looks for timestamped versions like: SME_Member_Details_Template_20260209_161234.xlsx
+    
+    Args:
+        output_dir: Directory where the file should be
+        expected_filename: The expected filename (e.g., "SME_Member_Details_Template.xlsx")
+        portal_name: Name of the portal for logging
+        logger: Logger instance
+        
+    Returns:
+        Tuple of (found_file_path, actual_filename) or (None, None) if not found
+    """
+    # First try the exact filename
+    exact_path = os.path.join(output_dir, expected_filename)
+    if os.path.exists(exact_path):
+        logger.info(f"Found exact match for {portal_name}: {expected_filename}")
+        return exact_path, expected_filename
+    
+    # If exact file not found, look for timestamped versions
+    # Pattern: filename_YYYYMMDD_HHMMSS.xlsx
+    base_name = os.path.splitext(expected_filename)[0]  # Remove .xlsx extension
+    pattern = f"{base_name}_[0-9]{{8}}_[0-9]{{6}}.xlsx"
+    
+    if os.path.exists(output_dir):
+        files_in_dir = os.listdir(output_dir)
+        timestamped_files = []
+        
+        for file in files_in_dir:
+            if re.match(pattern.replace("[", "\\[").replace("]", "\\]"), file):
+                timestamped_files.append(file)
+        
+        if timestamped_files:
+            # Sort and get the most recent (last alphabetically due to timestamp format)
+            most_recent = sorted(timestamped_files)[-1]
+            timestamped_path = os.path.join(output_dir, most_recent)
+            logger.warning(f"Expected file '{expected_filename}' not found for {portal_name}, using timestamped version: '{most_recent}'")
+            return timestamped_path, most_recent
+    
+    # No file found at all
+    return None, None
+
 
 def normalize_portal_name(company_name):
     """
@@ -387,6 +437,8 @@ async def run_census_loop():
                         logger.error(error_msg)
                         failed_portals.append({"portal": portal, "reason": "Portal name not recognized"})
                         processing_errors.append(error_msg)
+                        # Log failed portal to database
+                        insert_failed_census(upload_id, portal, "Portal name not recognized - no mapping available")
                         continue
                     
                     # Get mapper for the normalized portal
@@ -396,6 +448,12 @@ async def run_census_loop():
                         logger.warning(error_msg)
                         failed_portals.append({"portal": portal, "reason": "No mapper available"})
                         processing_errors.append(error_msg)
+                        # Log failed portal to database with specific reason
+                        companies_without_mappers = ["ALITTHIHAD", "ALSAGR", "FIDELITY", "MEDGULF", "NGI", "ORIENT", "QATAR", "RAK", "TAKAFUL", "WATANIATAKAFUL"]
+                        if normalized_portal in companies_without_mappers:
+                            insert_failed_census(upload_id, portal, f"Mapper not yet implemented for {normalized_portal} - development in progress")
+                        else:
+                            insert_failed_census(upload_id, portal, f"No mapper implementation available for portal {normalized_portal}")
                         continue
                     
                     func, output_dir, filename = mapper_info
@@ -410,8 +468,8 @@ async def run_census_loop():
                     if func not in processed_mappers:
                         logger.info(f"Running census mapper for '{portal}' (function: {func.__name__})...")
                         try:
-                            # Pass other_data to mappers that support it (like GIG)
-                            if normalized_portal == 'GIG':
+                            # Pass other_data to mappers that support it (like GIG and DAMAN)
+                            if normalized_portal in ['GIG', 'DAMAN']:
                                 func('default', other_data)
                             else:
                                 func('default')
@@ -423,15 +481,19 @@ async def run_census_loop():
                             logger.error(f"Full traceback for '{portal}': {traceback.format_exc()}")
                             failed_portals.append({"portal": portal, "reason": f"Mapper execution error: {str(e)}"})
                             processing_errors.append(error_msg)
+                            # Log failed portal to database with execution error
+                            insert_failed_census(upload_id, portal, f"Mapper execution failed: {str(e)}")
                             continue
                     else:
                         logger.info(f"Mapper function already executed for '{portal}' (shared mapper)")
                     
                     # 7. Check output and Insert
-                    output_path = os.path.join(output_dir, filename)
-                    if os.path.exists(output_path):
+                    # Use helper function to find file (handles timestamped versions)
+                    output_path, actual_filename = find_generated_file(output_dir, filename, portal, logger)
+                    
+                    if output_path and os.path.exists(output_path):
                         file_size = os.path.getsize(output_path)
-                        logger.info(f"📁 Output file found for '{portal}': {filename} ({file_size:,} bytes)")
+                        logger.info(f"📁 Output file found for '{portal}': {actual_filename} ({file_size:,} bytes)")
                         
                         # Add a brief delay for Excel COM files to ensure they're fully closed
                         if normalized_portal in ['DAMAN', 'IQ'] and func.__name__ in ['daman_map_data', 'iq_map_data']:
@@ -449,8 +511,10 @@ async def run_census_loop():
                             logger.error(error_msg)
                             failed_portals.append({"portal": portal, "reason": "Database insertion failed"})
                             processing_errors.append(error_msg)
+                            # Log failed portal to database
+                            insert_failed_census(upload_id, portal, f"Database insertion failed - could not store census file in Census_Portal_Excels table")
                     else:
-                        error_msg = f"Expected output file not found for {portal}: {output_path}"
+                        error_msg = f"Expected output file not found for {portal}: {os.path.join(output_dir, filename)}"
                         logger.error(error_msg)
                         # List what files are actually in the directory
                         if os.path.exists(output_dir):
@@ -461,6 +525,8 @@ async def run_census_loop():
                         
                         failed_portals.append({"portal": portal, "reason": "Output file not generated"})
                         processing_errors.append(error_msg)
+                        # Log failed portal to database with file generation failure
+                        insert_failed_census(upload_id, portal, f"Census file not generated - expected file {filename} not found at {os.path.join(output_dir, filename)}")
                         
                 except Exception as e:
                     error_msg = f"Unexpected error processing {portal}: {str(e)}"
@@ -468,6 +534,8 @@ async def run_census_loop():
                     logger.error(f"Full traceback for {portal}: {traceback.format_exc()}")
                     failed_portals.append({"portal": portal, "reason": f"Unexpected error: {str(e)}"})
                     processing_errors.append(error_msg)
+                    # Log failed portal to database with unexpected error
+                    insert_failed_census(upload_id, portal, f"Unexpected processing error: {str(e)}")
             
             # 8. Generate Processing Summary
             logger.info(f"\n" + "="*60)

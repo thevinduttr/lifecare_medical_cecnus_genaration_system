@@ -91,15 +91,23 @@ def gig_map_census_data(id, other_data=None):
     ##Effective Date - Read from database other_data instead of Excel file
     effective_date = None
     
-    # Try to get effective date from other_data first
+    # Try to get effective date from other_data first - support multiple key formats
     if other_data and isinstance(other_data, dict):
-        effective_date = other_data.get('Effective from')
-        if effective_date:
-            logger.info(f"Using effective date from database: {effective_date}")
+        # Try multiple possible key formats for effective date
+        possible_keys = ['Effective from', 'effective_from', 'effective_date', 'effectiveFrom']
+        for key in possible_keys:
+            effective_date = other_data.get(key)
+            if effective_date:
+                logger.info(f"Using effective date from database (key '{key}'): {effective_date}")
+                break
+        
+        if not effective_date:
+            logger.info("Effective date not found in database (tried keys: {}), trying to read from Excel file...".format(', '.join(possible_keys)))
     
     # Fallback to reading from Excel file if not found in other_data
     if not effective_date:
-        logger.info("Effective date not found in database, trying to read from Excel file...")
+        if not other_data:  # Only show this message if no other_data was provided at all
+            logger.info("Effective date not found in database, trying to read from Excel file...")
         df1, df2 = read_excel('GIG Insurance', 'default')
         
         # Check if the dataframes are empty

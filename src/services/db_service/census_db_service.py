@@ -151,7 +151,8 @@ def insert_generated_census(upload_id, portal, file_path):
             "upload_id": upload_id,
             "portal": portal,
             "census": encoded_string,
-            "status": "Completed"
+            "status": "Completed",
+            "log": f"Successfully generated census file: {os.path.basename(file_path)} ({file_size:,} bytes)"
         }
         
         db.insert_record("Census_Portal_Excels", data)
@@ -173,4 +174,77 @@ def insert_generated_census(upload_id, portal, file_path):
                 except:
                     logger.error("Unable to get file statistics")
         
+        return False
+
+def insert_failed_census(upload_id, portal, failure_reason):
+    """
+    Insert a failed census record into Census_Portal_Excels with failure details.
+    
+    Args:
+        upload_id (int): The upload ID from Census_Excel_Uploads
+        portal (str): The portal name that failed
+        failure_reason (str): Detailed reason for the failure
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        db = MySQLDatabase(DB_HOST, DB_NAME, DB_USER, DB_PASSWORD)
+        if not db.connect():
+            logger.error(f"Failed to connect to database for failed {portal}")
+            return False
+            
+        data = {
+            "upload_id": upload_id,
+            "portal": portal,
+            "census": "",  # Empty string instead of NULL for failed portals
+            "status": "Failed",
+            "log": f"FAILED: {failure_reason}"
+        }
+        
+        db.insert_record("Census_Portal_Excels", data)
+        db.disconnect()
+        logger.info(f"Inserted failed census record for {portal} (Upload ID: {upload_id}): {failure_reason}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error inserting failed census record for {portal}: {e}")
+        return False
+
+def update_census_portal_status(upload_id, portal, status, log_message=None):
+    """
+    Update the status and log of an existing Census_Portal_Excels record.
+    
+    Args:
+        upload_id (int): The upload ID
+        portal (str): The portal name
+        status (str): New status ('Pending', 'Completed', 'Failed')
+        log_message (str): Optional log message to append
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        db = MySQLDatabase(DB_HOST, DB_NAME, DB_USER, DB_PASSWORD)
+        if not db.connect():
+            logger.error(f"Failed to connect to database for {portal}")
+            return False
+        
+        update_data = {"status": status}
+        if log_message:
+            update_data["log"] = log_message
+            
+        condition = f"upload_id = {upload_id} AND portal = '{portal}'"
+        result = db.update_record("Census_Portal_Excels", update_data, condition)
+        db.disconnect()
+        
+        if result:
+            logger.info(f"Updated {portal} status to {status} for upload {upload_id}")
+        else:
+            logger.warning(f"No records updated for {portal} upload {upload_id}")
+            
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error updating census portal status for {portal}: {e}")
         return False

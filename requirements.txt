@@ -1,0 +1,52 @@
+# Web automation and browser control
+patchright>=1.45.0
+playwright>=1.40.0
+undetected-playwright>=0.2.0
+
+# Excel and data processing
+pandas>=2.2.0
+openpyxl>=3.1.0
+xlwings>=0.32.0
+xlrd>=2.0.0
+numpy>=1.24.0
+
+# Database connectivity
+mysql-connector-python>=9.0.0
+
+# HTTP client and web requests
+httpx>=0.24.0
+
+# PDF processing
+pdfplumber>=0.10.0
+
+# Captcha solving
+twocaptcha>=1.0.0
+
+# Windows automation and COM interfaces
+pywin32>=308
+pyautogui>=0.9.54
+keyboard>=0.13.5
+
+# Configuration and YAML
+PyYAML>=6.0.0
+
+# File operations
+aiofiles>=24.1.0
+
+# Date and time utilities
+python-dateutil>=2.9.0
+
+# JWT token handling  
+PyJWT>=2.10.0
+
+# Timezone utilities
+pytz>=2025.2
+
+# URL handling
+urllib3>=2.6.0
+
+# Utility libraries
+six>=1.17.0
+et_xmlfile>=2.0.0
+pycparser>=2.23
+tzdata>=2025.3
